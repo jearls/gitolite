@@ -329,10 +329,12 @@ sub gl_log {
 }
 
 sub logger_plus_stderr {
-    open my $fh, "|-", "logger" or confess "it's really not my day is it...?\n";
+    require Sys::Syslog;
+    Sys::Syslog->import(qw(:standard));
+    openlog("gitolite", "pid", "local0");
     for (@_) {
         print STDERR "FATAL: $_\n";
-        print $fh "FATAL: $_\n";
+        syslog( 'err', "%s", $_);
     }
     exit 1;
 }
