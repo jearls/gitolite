@@ -168,6 +168,32 @@ sub print_status {
 # server side commands.  Very little error checking.
 #   gitolite mirror list master <repo>
 #   gitolite mirror list slaves <repo>
+#   gitolite mirror remote-command <slave> <repo> <command> [<args>...]
+#   gitolite mirror remote-command all <repo> <command> [<args>...]
+
+# our own version of the backtick operators without letting the shell
+# interfere.
+#
+# Usage:  backtick_no_shell(\*FH, command...)
+# The STDOUT and STDERR of the command are merged into FH.
+# There is no way to feed data to the command.
+#
+# command is treated as a list and passed to exec.
+
+sub backtick_no_shell {
+    my $fh = shift;
+
+    trace( 1, 'backtick_no_shell', @_ );
+
+    my $pid = open($fh, "-|");
+    _die "unable to fork to run " . join(' ', @_) . ": $!" unless (defined $pid);
+
+    return if ($pid);
+
+    open STDERR, '>&STDOUT';
+    trace( 1, 'exec', '{', $_[0], '}', @_ );
+    (exec { $_[0] } @_) || _die "unable to exec " . join(' ', @_) . ": $!";
+}
 
 sub server_side_commands {
     if ( $cmd eq 'list' ) {
@@ -178,6 +204,53 @@ sub server_side_commands {
             say join( " ", sort keys %list );
         } else {
             _die "gitolite mirror list master|slaves <reponame>";
+        }
+    } elsif ( $cmd eq 'remote-command' ) {
+        # skip past the 'remote-command', $host, and $repo args
+        shift; shift; shift;
+
+        # 'host' can be a single server name, 'slaves', 'master', 'all',
+        # or 'all!'
+        # With 'slaves', 'master', or 'all', this will execute on all
+        # such servers _except_ the local server.
+        # With a single server name, or with 'all!', that exception is
+        # removed, and the local server will be called if named or part
+        # of the slaves or master list.
+        my @slaves = ();
+        my $force = 0;
+        if ($host eq 'master' or $host eq 'slaves' or $host eq 'all' or $host eq 'all!') {
+            if ($host ne 'master') {
+                my %slave_list = repo_slaves($repo);
+                push(@slaves, keys %slave_list);
+            }
+            if ($host ne 'slaves') {
+                push(@slaves, repo_master($repo));
+            }
+            $force = ($host eq 'all!');
+        } else {
+            push(@slaves, $host);
+            $force = 1;
+        }
+
+        # for each listed server that is not the current host (or all
+        # servers when $force is true), issue the remote gitolite command
+        # via ssh.
+        # We want to prefix the output with the slave name, which means
+        # we can't use the system() call.  We want to capture both STDERR
+        # and STDOUT, but we don't want to pass our command through the
+        # shell in case it has shell special characters in it.  Therefore
+        # we have to create our own version of the backtick operators that
+        # don't use the shell.
+
+        foreach my $s (@slaves) {
+            if ($force or $s ne $rc{HOSTNAME}) {
+                backtick_no_shell(\*REMOTE_EXEC, 'ssh', $s, @_);
+                while (my $line = <REMOTE_EXEC>) {
+                    chomp $line;
+                    print "${s}: ${line}\n";
+                }
+                close(REMOTE_EXEC) || _die "remote execution of " . join(' ', 'ssh', $s, @_) . " failed: $!";
+            }
         }
     } else {
         _die "invalid command";
