@@ -1,8 +1,10 @@
 #!/bin/sh
 
-# Usage:    ssh git@host symbolic-ref <repo> <arguments to git-symbolic-ref>
+# Usage:    ssh git@host symbolic-ref [ -M ] <repo> <arguments to git-symbolic-ref>
 #
 # allow 'git symbolic-ref' over a gitolite connection
+#
+# Include the -M flag to apply this command to all servers that mirror the repo
 
 # Security: remember all arguments to commands must match a very conservative
 # pattern.  Once that is assured, the symbolic-ref command has no security
@@ -14,6 +16,31 @@
 # supply a "reason" string.  In any case this is useless by default; you'd
 # have to have core.logAllRefUpdates set for it to have any meaning.
 
+# update to support mirroring:
+#
+# The -M flag is used whenever we're doing a mirror-involved update.
+# On the initial call, initiated by a user, GL_USER will be the user's
+# gitolite username, which will [should] not begin with "server-".
+# This gives us a way to check for the initial update call.  Only when
+# we are in the initial call do we identify the master server, fail if
+# we're not running _on_ the master server, and then use the mirror
+# "remote-command" function to call the symbolic-ref command on the
+# slaves.
+#
+# When we call the slaves, however, we still pass the -M flag in order
+# to take advantage of its "side-effect": with the -M flag, we prefix
+# the output from the git command with the gitolite server name.
+#
+# For example:
+# ssh git@gitolite-server symbolic-ref -M testing HEAD
+#
+# With only one argument, this will report the current HEAD on each
+# server:
+#   $ ssh git@gitolite-server symbolic-ref -M testing HEAD
+#   another-server: refs/heads/master
+#   slave-nubmer-3: refs/heads/master
+#   gitolite-server: refs/heads/master
+
 die() { echo "$@" >&2; exit 1; }
 usage() { perl -lne 'print substr($_, 2) if /^# Usage/../^$/' < $0; exit 1; }
 [ -z "$1" ] && usage
@@ -21,11 +48,48 @@ usage() { perl -lne 'print substr($_, 2) if /^# Usage/../^$/' < $0; exit 1; }
 [ -z "$GL_USER" ] && die GL_USER not set
 
 # ----------------------------------------------------------------------
+
+if [ "$1" = "-M" ]; then
+    shift
+    # We only do mirror replication if we're being called by a non-server
+    # user.
+    # Only in the case of replication do we set the mirror_master variable
+    # to the master server for the repo - this controls invoking the mirror
+    # command to update the slaves.
+    # Any time we have the -M option, we also set the mirror_server and
+    # output_prefix variables:
+    #   mirror_server is the gitolite HOSTNAME for this server
+    #   output_prefix will be set to "${mirror_server}: ", but will
+    #   have all \ and / characters escaped by a \ (to survive the 'sed'
+    #   command).
+
+    # we have to use $1 for the repo, since $repo hasn't been defined yet
+
+    if [ "${GL_USER%%-*}" != "server" ]; then
+        mirror_master=`GL_USER='' gitolite mirror list master "$1"`
+        [ -n "$mirror_master" ] || die "No mirroring defined for $1"
+        mirror_server=`/usr/bin/perl -e 'do ".gitolite.rc"; print $RC{"HOSTNAME"}, "\n";'`
+        output_prefix=`echo "${mirror_server}: " | sed -e 's;[\\/];\\&;g'`
+    fi
+fi
+
 repo=$1; shift
 repo=${repo%.git}
-gitolite access -q "$repo" $GL_USER W any || die You are not authorised
 
-# change head
-cd $GL_REPO_BASE/$repo.git
+# don't check access if we're in a mirror call; access has already been checked on the master
+[ "${GL_USER%%-*}" = "server" ] || gitolite access -q "$repo" $GL_USER W any || die You are not authorised
 
-git symbolic-ref "$@"
+# If the mirror master is defined, make sure we're it.
+[ -z "$mirror_master" ] || [ "x$mirror_master" == "x$mirror_server" ] || die "Issue this command to the $mirror_master master server"
+
+# if we have a master, use the mirror remote-command to pass the command to all servers, master and slave.
+# otherwise, just run the local command
+if [ -n "$mirror_master" ]; then
+    # unset the GL_USER so we can use the server-side mirroring commands
+    unset GL_USER
+    gitolite mirror remote-command 'all!' "$repo" symbolic-ref "$repo" "$@"
+else
+    # change head
+    cd $GL_REPO_BASE/$repo.git
+    git symbolic-ref "$@"
+fi
